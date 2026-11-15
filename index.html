@@ -22,11 +22,13 @@ canvas {
   position: absolute;
   top: 10px;
   left: 10px;
+  right: 10px;
   color: #0f0;
-  font-size: 18px;
+  font-size: 17px;
   text-shadow: 0 0 5px #0f0;
   pointer-events: none;
   z-index: 10;
+  line-height: 1.4;
 }
 #overlay {
   position: absolute;
@@ -48,7 +50,7 @@ canvas {
   text-shadow: 0 0 10px #0ff;
 }
 #overlay p {
-  font-size: 1.2em;
+  font-size: 1.15em;
   margin-bottom: 30px;
   line-height: 1.5;
 }
@@ -72,11 +74,12 @@ button:active {
 <body>
 <canvas id="c"></canvas>
 <div id="ui">
-  Счёт: <span id="score">0</span> | Жизни: <span id="lives">❤️❤️❤️</span> | Рекорд: <span id="high">0</span>
+  Счёт: <span id="score">0</span> | Жизни: <span id="lives">❤️❤️❤️</span> | Рекорд: <span id="high">0</span><br>
+  Оружие: <span id="weapon">Ур.1 (Медленно)</span>
 </div>
 <div id="overlay">
   <h1>🐱 Кибер-Кот</h1>
-  <p>Защити галактику от смешных пришельцев!<br>Стреляй лазерами и не дай им добраться до низа.</p>
+  <p>Защити галактику от смешных пришельцев!<br>Лови ⚡ патроны для ускорения, тройного залпа и больших пуль, а ❤️ — для жизней.</p>
   <button id="startBtn">Начать Игру</button>
 </div>
 <script>
@@ -85,26 +88,35 @@ const ctx = canvas.getContext('2d');
 const uiScore = document.getElementById('score');
 const uiLives = document.getElementById('lives');
 const uiHigh = document.getElementById('high');
+const uiWeapon = document.getElementById('weapon');
 const overlay = document.getElementById('overlay');
 const startBtn = document.getElementById('startBtn');
 
-// Game state (объявляем до resize)
+// Состояние игры
 let W = 0, H = 0;
 let player = null;
 let bullets = [];
 let enemies = [];
+let pickups = [];
 let particles = [];
+let floatingTexts = [];
 let stars = [];
+
 let score = 0;
 let lives = 3;
+const MAX_LIVES = 5;
 let highScore = parseInt(localStorage.getItem('cybercat_high') || '0', 10);
 let gameRunning = false;
 let spawnTimer = 0;
+let pickupTimer = 0;
 let difficulty = 1;
+let ammoBonus = 0;
+let announcedTriple = false;
+let lastAnnouncedSize = 1;
+
 let keys = {};
 let touchX = null;
 let lastShot = 0;
-let autoFireId = null;
 
 uiHigh.textContent = highScore;
 
@@ -119,7 +131,7 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-// Audio
+// Звук
 let audioCtx = null;
 function initAudio() {
   if (!audioCtx) {
@@ -147,6 +159,24 @@ function beep(freq, dur = 0.1, type = 'square', vol = 0.08) {
   o.stop(audioCtx.currentTime + dur);
 }
 
+function getWeaponStats() {
+  // Темп стрельбы: сначала медленно (460 мс), потом ускоряется до 120 мс
+  const fireDelay = Math.max(120, 460 - Math.floor(score / 15) * 10 - ammoBonus * 35);
+  // Тройная стрельба: от 250 очков или от 2 пойманных бонусов патронов
+  const tripleShot = score >= 250 || ammoBonus >= 2;
+  // Размер пуль: увеличивается от счёта и пойманных патронов (уровни 1..5)
+  const sizeLevel = Math.min(5, 1 + Math.floor(score / 200) + ammoBonus);
+  const bulletW = 6 + (sizeLevel - 1) * 3;
+  const bulletH = 16 + (sizeLevel - 1) * 4;
+
+  let color = '#0ff';
+  if (sizeLevel === 3) color = '#0f0';
+  if (sizeLevel === 4) color = '#ff0';
+  if (sizeLevel >= 5) color = '#f0f';
+
+  return { fireDelay, tripleShot, sizeLevel, bulletW, bulletH, color };
+}
+
 function initGame() {
   player = {
     x: W / 2 - 30,
@@ -157,7 +187,9 @@ function initGame() {
   };
   bullets = [];
   enemies = [];
+  pickups = [];
   particles = [];
+  floatingTexts = [];
   stars = [];
   for (let i = 0; i < 100; i++) {
     stars.push({
@@ -170,7 +202,11 @@ function initGame() {
   score = 0;
   lives = 3;
   difficulty = 1;
+  ammoBonus = 0;
+  announcedTriple = false;
+  lastAnnouncedSize = 1;
   spawnTimer = 0;
+  pickupTimer = 0;
   lastShot = 0;
   updateUI();
 }
@@ -183,6 +219,15 @@ function updateUI() {
     localStorage.setItem('cybercat_high', String(highScore));
     uiHigh.textContent = highScore;
   }
+
+  const w = getWeaponStats();
+  const speedText = w.fireDelay > 340 ? 'Медленно' : w.fireDelay > 220 ? 'Быстро' : 'Турбо';
+  const modeText = w.tripleShot ? '3 пули' : '1 пуля';
+  uiWeapon.textContent = `Ур.${w.sizeLevel} (${speedText}, ${modeText})`;
+}
+
+function addFloatingText(x, y, text, color = '#0ff') {
+  floatingTexts.push({ x, y, text, color, life: 55 });
 }
 
 const enemyTypes = [
@@ -212,20 +257,49 @@ function spawnEnemy() {
   });
 }
 
+function spawnPickup(x = null, y = -40, forcedType = null) {
+  const size = 36;
+  const type = forcedType || (Math.random() < 0.6 ? 'ammo' : 'life');
+  pickups.push({
+    x: x !== null ? Math.max(10, Math.min(W - size - 10, x)) : Math.random() * Math.max(1, W - size),
+    y,
+    w: size,
+    h: size,
+    type,
+    emoji: type === 'ammo' ? '⚡' : '❤️',
+    speed: 2.5
+  });
+}
+
 function shoot() {
   if (!gameRunning || !player) return;
+  const w = getWeaponStats();
   const now = Date.now();
-  if (now - lastShot < 150) return;
+  if (now - lastShot < w.fireDelay) return;
   lastShot = now;
 
-  bullets.push({
-    x: player.x + player.w / 2 - 3,
-    y: player.y,
-    w: 6,
-    h: 15,
-    speed: 12
-  });
-  beep(800, 0.05, 'square', 0.05);
+  const cx = player.x + player.w / 2 - w.bulletW / 2;
+  const topY = player.y - w.bulletH / 2;
+
+  if (w.tripleShot) {
+    bullets.push(
+      { x: cx - 10, y: topY + 4, w: w.bulletW, h: w.bulletH, vx: -2.4, vy: -12, color: w.color },
+      { x: cx,      y: topY,     w: w.bulletW, h: w.bulletH, vx: 0,    vy: -12, color: w.color },
+      { x: cx + 10, y: topY + 4, w: w.bulletW, h: w.bulletH, vx: 2.4,  vy: -12, color: w.color }
+    );
+    beep(920, 0.05, 'square', 0.045);
+  } else {
+    bullets.push({
+      x: cx,
+      y: topY,
+      w: w.bulletW,
+      h: w.bulletH,
+      vx: 0,
+      vy: -12,
+      color: w.color
+    });
+    beep(800, 0.05, 'square', 0.05);
+  }
 }
 
 function explode(x, y, color = '#ff0') {
@@ -244,10 +318,23 @@ function explode(x, y, color = '#ff0') {
   beep(200, 0.15, 'sawtooth', 0.1);
 }
 
+function checkWeaponMilestones() {
+  const w = getWeaponStats();
+  if (w.tripleShot && !announcedTriple && player) {
+    announcedTriple = true;
+    addFloatingText(player.x + player.w / 2, player.y - 30, 'ТРОЙНОЙ ЗАЛП x3!', '#0ff');
+    beep(1000, 0.15, 'triangle', 0.1);
+  }
+  if (w.sizeLevel > lastAnnouncedSize && player) {
+    lastAnnouncedSize = w.sizeLevel;
+    addFloatingText(player.x + player.w / 2, player.y - 55, `ПАТРОНЫ УР.${w.sizeLevel}!`, w.color);
+  }
+}
+
 function update() {
   if (!gameRunning || !player) return;
 
-  // Stars
+  // Звёзды
   for (let i = 0; i < stars.length; i++) {
     const s = stars[i];
     s.y += s.sp;
@@ -257,7 +344,7 @@ function update() {
     }
   }
 
-  // Player movement
+  // Движение игрока
   if (keys['ArrowLeft'] || keys['KeyA']) player.x -= player.speed;
   if (keys['ArrowRight'] || keys['KeyD']) player.x += player.speed;
   if (touchX !== null) {
@@ -265,23 +352,34 @@ function update() {
   }
   player.x = Math.max(0, Math.min(W - player.w, player.x));
 
-  // Manual shoot on space
-  if (keys['Space']) {
-    shoot();
-  }
+  // Автоматическая стрельба с текущим темпом (или по пробелу)
+  shoot();
 
-  // Bullets
+  // Пули
   for (let i = bullets.length - 1; i >= 0; i--) {
-    bullets[i].y -= bullets[i].speed;
-    if (bullets[i].y < -20) bullets.splice(i, 1);
+    const b = bullets[i];
+    b.x += b.vx;
+    b.y += b.vy;
+    if (b.y < -40 || b.x < -40 || b.x > W + 40) {
+      bullets.splice(i, 1);
+    }
   }
 
-  // Enemies
+  // Спавн врагов
   spawnTimer++;
-  if (spawnTimer > Math.max(30, 80 - difficulty * 5)) {
+  if (spawnTimer > Math.max(28, 80 - difficulty * 5)) {
     spawnEnemy();
     spawnTimer = 0;
   }
+
+  // Периодический спавн падающих патронов и жизней сверху
+  pickupTimer++;
+  if (pickupTimer > 280) {
+    spawnPickup();
+    pickupTimer = 0;
+  }
+
+  // Движение врагов
   for (let i = enemies.length - 1; i >= 0; i--) {
     const e = enemies[i];
     e.y += e.speed;
@@ -297,7 +395,42 @@ function update() {
     }
   }
 
-  // Particles
+  // Движение и ловля бонусов (патроны и жизни)
+  for (let i = pickups.length - 1; i >= 0; i--) {
+    const p = pickups[i];
+    p.y += p.speed;
+
+    if (player.x < p.x + p.w && player.x + player.w > p.x &&
+        player.y < p.y + p.h && player.y + player.h > p.y) {
+      if (p.type === 'ammo') {
+        ammoBonus++;
+        score += 20;
+        addFloatingText(p.x + p.w / 2, p.y, '⚡ ПАТРОНЫ +', '#ff0');
+        beep(650, 0.08, 'triangle', 0.1);
+        setTimeout(() => beep(950, 0.1, 'triangle', 0.1), 70);
+        checkWeaponMilestones();
+      } else {
+        if (lives < MAX_LIVES) {
+          lives++;
+          addFloatingText(p.x + p.w / 2, p.y, '+1 ❤️', '#f55');
+        } else {
+          score += 50;
+          addFloatingText(p.x + p.w / 2, p.y, '+50 ОЧКОВ!', '#f55');
+        }
+        beep(520, 0.08, 'sine', 0.12);
+        setTimeout(() => beep(780, 0.12, 'sine', 0.12), 70);
+      }
+      pickups.splice(i, 1);
+      updateUI();
+      continue;
+    }
+
+    if (p.y > H + 40) {
+      pickups.splice(i, 1);
+    }
+  }
+
+  // Частицы
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
     p.x += p.vx;
@@ -306,7 +439,15 @@ function update() {
     if (p.life <= 0) particles.splice(i, 1);
   }
 
-  // Collisions: bullets vs enemies
+  // Всплывающие надписи
+  for (let i = floatingTexts.length - 1; i >= 0; i--) {
+    const t = floatingTexts[i];
+    t.y -= 1.2;
+    t.life--;
+    if (t.life <= 0) floatingTexts.splice(i, 1);
+  }
+
+  // Столкновения: пули и враги
   for (let bi = bullets.length - 1; bi >= 0; bi--) {
     const b = bullets[bi];
     for (let ei = enemies.length - 1; ei >= 0; ei--) {
@@ -315,16 +456,23 @@ function update() {
           b.y < e.y + e.h && b.y + b.h > e.y) {
         explode(e.x + e.w / 2, e.y + e.h / 2);
         score += e.points;
+
+        // Шанс выпадения бонуса из сбитого врага (15%)
+        if (Math.random() < 0.15) {
+          spawnPickup(e.x + e.w / 2 - 18, e.y);
+        }
+
         bullets.splice(bi, 1);
         enemies.splice(ei, 1);
         difficulty = 1 + Math.floor(score / 100);
+        checkWeaponMilestones();
         updateUI();
         break;
       }
     }
   }
 
-  // Collisions: player vs enemies
+  // Столкновения: игрок и враги
   for (let ei = enemies.length - 1; ei >= 0; ei--) {
     const e = enemies[ei];
     if (player.x < e.x + e.w && player.x + player.w > e.x &&
@@ -345,7 +493,7 @@ function update() {
 function draw() {
   ctx.clearRect(0, 0, W, H);
 
-  // Stars
+  // Звёзды
   ctx.fillStyle = '#fff';
   stars.forEach(s => {
     ctx.globalAlpha = 0.5 + Math.random() * 0.5;
@@ -353,7 +501,7 @@ function draw() {
   });
   ctx.globalAlpha = 1;
 
-  // Particles
+  // Частицы
   particles.forEach(p => {
     ctx.globalAlpha = Math.max(0, p.life / 50);
     ctx.fillStyle = p.color;
@@ -361,30 +509,62 @@ function draw() {
   });
   ctx.globalAlpha = 1;
 
-  // Bullets (тень задаётся ДО отрисовки)
-  ctx.fillStyle = '#0ff';
-  ctx.shadowColor = '#0ff';
-  ctx.shadowBlur = 10;
+  // Пули
   bullets.forEach(b => {
+    ctx.fillStyle = b.color;
+    ctx.shadowColor = b.color;
+    ctx.shadowBlur = 12;
     ctx.fillRect(b.x, b.y, b.w, b.h);
   });
   ctx.shadowBlur = 0;
 
-  // Enemies
+  // Падающие бонусы (патроны и жизни)
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
+  pickups.forEach(p => {
+    const cx = p.x + p.w / 2;
+    const cy = p.y + p.h / 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, p.w / 2 + 2, 0, Math.PI * 2);
+    ctx.fillStyle = p.type === 'ammo' ? 'rgba(255, 220, 0, 0.25)' : 'rgba(255, 60, 100, 0.25)';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = p.type === 'ammo' ? '#ff0' : '#f46';
+    ctx.stroke();
+
+    ctx.font = '24px Arial';
+    ctx.fillStyle = '#fff';
+    ctx.fillText(p.emoji, cx, cy + 1);
+  });
+
+  // Враги
   enemies.forEach(e => {
     ctx.font = `${e.w}px Arial`;
     ctx.fillText(e.emoji, e.x + e.w / 2, e.y + e.h / 2);
   });
 
-  // Player
+  // Игрок
   if (gameRunning && player) {
     ctx.font = '60px Arial';
     ctx.fillText('🐱', player.x + player.w / 2, player.y + player.h / 2);
-    ctx.fillStyle = 'rgba(0, 255, 255, 0.3)';
-    ctx.fillRect(player.x + player.w / 2 - 2, player.y - 10, 4, 10);
+    const w = getWeaponStats();
+    ctx.fillStyle = w.color;
+    ctx.globalAlpha = 0.45;
+    ctx.fillRect(player.x + player.w / 2 - w.bulletW / 2, player.y - 10, w.bulletW, 10);
+    ctx.globalAlpha = 1;
   }
+
+  // Всплывающий текст бонусов
+  floatingTexts.forEach(t => {
+    ctx.globalAlpha = Math.max(0, t.life / 55);
+    ctx.font = 'bold 18px Segoe UI, Arial';
+    ctx.fillStyle = t.color;
+    ctx.shadowColor = t.color;
+    ctx.shadowBlur = 8;
+    ctx.fillText(t.text, t.x, t.y);
+  });
+  ctx.shadowBlur = 0;
+  ctx.globalAlpha = 1;
 }
 
 function gameLoop() {
@@ -397,10 +577,6 @@ function gameOver() {
   gameRunning = false;
   touchX = null;
   keys = {};
-  if (autoFireId) {
-    clearInterval(autoFireId);
-    autoFireId = null;
-  }
   overlay.classList.remove('hidden');
   overlay.innerHTML = `
     <h1>💥 Игра Окончена!</h1>
@@ -416,13 +592,9 @@ function startGame() {
   initGame();
   gameRunning = true;
   overlay.classList.add('hidden');
-  if (autoFireId) clearInterval(autoFireId);
-  autoFireId = setInterval(() => {
-    if (gameRunning) shoot();
-  }, 180);
 }
 
-// Input
+// Управление
 document.addEventListener('keydown', e => {
   keys[e.code] = true;
   if (e.code === 'Space' && gameRunning) {
@@ -458,7 +630,7 @@ canvas.addEventListener('touchcancel', () => {
 
 startBtn.onclick = startGame;
 
-// Инициализируем фон и запускаем цикл
+// Запуск фона и игрового цикла
 initGame();
 gameLoop();
 </script>
